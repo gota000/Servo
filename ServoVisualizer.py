@@ -13,6 +13,13 @@ SEND_INTERVAL_SEC = 0.03
 ALL_FINGERS_NAME = "All Fingers"
 WAVE_ORDER = ["Pinky", "Ring", "Middle", "Pointer"]  # required order
 
+# Wrist servos (270 degrees)
+WRIST1_CH = 11
+WRIST2_CH = 12
+WRIST1_INIT = 135.0
+WRIST2_INIT = 135.0
+WRIST_RANGE = 270.0
+
 # Finger order MUST match Arduino:
 # 0=Pinky, 1=Ring, 2=Middle, 3=Pointer, 4=Thumb
 FINGERS = [
@@ -114,12 +121,16 @@ class App:
         self.updating_sliders = False
 
         # last send times per logical channel (manual throttle)
-        self.last_send_time = {0: 0.0, 1: 0.0, 2: 0.0}  # 0=top,1=bottom,2=thumb extra
+        self.last_send_time = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}  # 0=top,1=bottom,2=thumb extra,3=wrist1,4=wrist2
 
         # Remember angles per finger (manual)
         self.top_angles = [f["top_init"] for f in FINGERS]
         self.bottom_angles = [f["bottom_init"] for f in FINGERS]
         self.extra_angles = [f["extra_init"] if f["extra_init"] is not None else None for f in FINGERS]
+
+        # Wrist angles (global, not per-finger)
+        self.wrist1_angle = WRIST1_INIT
+        self.wrist2_angle = WRIST2_INIT
 
         self.finger_idx = tk.IntVar(value=DEFAULT_FINGER_IDX)
 
@@ -226,9 +237,31 @@ class App:
         self.extra_slider = ttk.Scale(self.extra_group, from_=0, to=180, orient="horizontal", command=self.on_extra_slider)
         self.extra_slider.pack(fill="x", pady=6)
 
+        # ---------- Wrist controls (global, not per-finger) ----------
+        wrist_frame = ttk.LabelFrame(parent, text="Wrist Servos (270° range) — Global", padding=10)
+        wrist_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        # Wrist 1 (ch 11)
+        wrist1_group = ttk.LabelFrame(wrist_frame, text=f"Wrist 1 (PCA ch {WRIST1_CH}) — 0–270°", padding=6)
+        wrist1_group.pack(fill="x", pady=(0, 6))
+        self.wrist1_lbl = tk.StringVar(value=f"Angle: {WRIST1_INIT:.1f}°")
+        ttk.Label(wrist1_group, textvariable=self.wrist1_lbl).pack(anchor="w")
+        self.wrist1_slider = ttk.Scale(wrist1_group, from_=0, to=WRIST_RANGE, orient="horizontal", command=self.on_wrist1_slider)
+        self.wrist1_slider.pack(fill="x", pady=4)
+        self.wrist1_slider.set(WRIST1_INIT)
+
+        # Wrist 2 (ch 12)
+        wrist2_group = ttk.LabelFrame(wrist_frame, text=f"Wrist 2 (PCA ch {WRIST2_CH}) — 0–270°", padding=6)
+        wrist2_group.pack(fill="x", pady=(0, 6))
+        self.wrist2_lbl = tk.StringVar(value=f"Angle: {WRIST2_INIT:.1f}°")
+        ttk.Label(wrist2_group, textvariable=self.wrist2_lbl).pack(anchor="w")
+        self.wrist2_slider = ttk.Scale(wrist2_group, from_=0, to=WRIST_RANGE, orient="horizontal", command=self.on_wrist2_slider)
+        self.wrist2_slider.pack(fill="x", pady=4)
+        self.wrist2_slider.set(WRIST2_INIT)
+
         hint = ttk.Label(
             parent,
-            text="Protocol:\n  F:<idx> selects finger\n  0:<deg> sets TOP, 1:<deg> sets BOTTOM, 2:<deg> sets THUMB EXTRA\nPots stream back as POT,a0_raw,a1_raw,a0_v,a1_v",
+            text="Protocol:\n  F:<idx> selects finger\n  0:<deg> sets TOP, 1:<deg> sets BOTTOM, 2:<deg> sets THUMB EXTRA\n  3:<deg> sets WRIST1 (ch11, 0-270°), 4:<deg> sets WRIST2 (ch12, 0-270°)\nPots stream back as POT,a0_raw,a1_raw,a0_v,a1_v",
             foreground="#444"
         )
         hint.pack(anchor="w", padx=12, pady=12)
@@ -402,6 +435,10 @@ class App:
             if self.has_extra(idx):
                 self.send_angle(2, float(self.extra_angles[idx]), force=True)
 
+            # Send wrist init positions
+            self.send_angle(3, self.wrist1_angle, force=True)
+            self.send_angle(4, self.wrist2_angle, force=True)
+
             self.root.after(20, self.poll_serial)
 
         except Exception as e:
@@ -557,6 +594,22 @@ class App:
         self.extra_angles[idx] = angle
         self.extra_lbl.set(f"Angle: {angle:.1f}°")
         self.send_angle(2, angle)
+
+    def on_wrist1_slider(self, value):
+        if self.updating_sliders or self.anim_running:
+            return
+        angle = float(value)
+        self.wrist1_angle = angle
+        self.wrist1_lbl.set(f"Angle: {angle:.1f}°")
+        self.send_angle(3, angle)  # logical channel 3 = wrist1
+
+    def on_wrist2_slider(self, value):
+        if self.updating_sliders or self.anim_running:
+            return
+        angle = float(value)
+        self.wrist2_angle = angle
+        self.wrist2_lbl.set(f"Angle: {angle:.1f}°")
+        self.send_angle(4, angle)  # logical channel 4 = wrist2
 
     def thumb_touch(self, target_name: str):
         """
@@ -909,11 +962,15 @@ class App:
             self.top_slider.state(["!disabled"] if enabled else ["disabled"])
             self.bottom_slider.state(["!disabled"] if enabled else ["disabled"])
             self.extra_slider.state(["!disabled"] if enabled else ["disabled"])
+            self.wrist1_slider.state(["!disabled"] if enabled else ["disabled"])
+            self.wrist2_slider.state(["!disabled"] if enabled else ["disabled"])
         except Exception:
             try:
                 self.top_slider.config(state=state)
                 self.bottom_slider.config(state=state)
                 self.extra_slider.config(state=state)
+                self.wrist1_slider.config(state=state)
+                self.wrist2_slider.config(state=state)
             except Exception:
                 pass
 
@@ -1024,6 +1081,11 @@ class App:
                 self.send_angle(1, FINGERS[idx]["bottom_init"], force=True)
                 if self.has_extra(idx):
                     self.send_angle(2, float(FINGERS[idx]["extra_init"]), force=True)
+
+                # Reset wrists to init
+                self.send_angle(3, WRIST1_INIT, force=True)
+                self.send_angle(4, WRIST2_INIT, force=True)
+
                 time.sleep(0.1)
         except Exception:
             pass

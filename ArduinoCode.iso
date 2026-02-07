@@ -1,0 +1,305 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// -------------------- PCA9685 --------------------
+static const uint8_t PCA9685_ADDR = 0x40; // Adafruit default
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(PCA9685_ADDR);
+
+// Keep your chosen frequency
+static const float PCA_FREQ_HZ = 330.0f;
+
+// -------------------- Servo calibration --------------------
+static const int SERVO_MIN_US = 500;
+static const int SERVO_MAX_US = 2500;
+
+// Fingers are 180° range
+static const float SERVO_RANGE_DEG = 180.0f;
+
+// Wrist servos are 270° range
+static const float WRIST_RANGE_DEG = 270.0f;
+static const uint8_t WRIST1_CH = 11;
+static const uint8_t WRIST2_CH = 12;
+
+// Pick safe init positions (middle of 270° = 135°).
+// Change these if your mechanics want a different “neutral”.
+static const float WRIST1_INIT = 135.0f;
+static const float WRIST2_INIT = 135.0f;
+
+// -------------------- Pots --------------------
+const int POT0_PIN = A0; // top pot
+const int POT1_PIN = A1; // bottom pot
+
+// RP2040 ADC is commonly 12-bit: 0..4095
+const int ADC_MAX = 4095;
+const float VREF = 3.3f;
+
+// -------------------- Finger mapping --------------------
+static const uint8_t NO_CH = 255;
+
+struct FingerConfig {
+  const char* name;
+  uint8_t bottomCh;
+  float bottomInit;
+  uint8_t topCh;
+  float topInit;
+
+  // Optional extra servo (only used by Thumb)
+  uint8_t extraCh;     // NO_CH if not used
+  float extraInit;
+};
+
+static const FingerConfig FINGERS[] = {
+  { "Pinky",   8, 140.0f,  4, 130.0f,  NO_CH, 0.0f },
+  { "Ring",    7, 55.0f,   3, 140.0f,  NO_CH, 0.0f },
+  { "Middle",  2, 30.0f,   1, 140.0f,  NO_CH, 0.0f },
+  { "Pointer", 5, 145.0f,  0, 40.0f,   NO_CH, 0.0f },
+  { "Thumb",   9, 60.0f,   10, 60.0f,  6, 80.0f },
+};
+
+static const uint8_t NUM_FINGERS = sizeof(FINGERS) / sizeof(FINGERS[0]);
+
+uint8_t currentFinger = 3; // default to Pointer (index 3)
+
+// Store last angles per finger so switching fingers doesn't "forget"
+float lastBottomDeg[NUM_FINGERS];
+float lastTopDeg[NUM_FINGERS];
+float lastExtraDeg[NUM_FINGERS]; // only meaningful when extraCh != NO_CH
+
+// Wrist remembered angles
+float lastWristDeg[2] = { WRIST1_INIT, WRIST2_INIT };
+
+// -------------------- Helpers --------------------
+static inline uint16_t microsecondsToTicks(int us, float freqHz) {
+  float periodUs = 1000000.0f / freqHz;
+  float ticks = (us / periodUs) * 4096.0f;
+  if (ticks < 0) ticks = 0;
+  if (ticks > 4095) ticks = 4095;
+  return (uint16_t)(ticks + 0.5f);
+}
+
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// Generic setter that supports different angle ranges (180 vs 270)
+void setServoAngleWithRange(uint8_t channel, float angleDeg, float rangeDeg) {
+  angleDeg = clampf(angleDeg, 0.0f, rangeDeg);
+
+  float t = angleDeg / rangeDeg; // 0..1
+  int us = (int)(SERVO_MIN_US + t * (SERVO_MAX_US - SERVO_MIN_US));
+
+  uint16_t ticks = microsecondsToTicks(us, PCA_FREQ_HZ);
+  pca.setPWM(channel, 0, ticks);
+}
+
+// Fingers use 180° mapping
+void setServoAngle(uint8_t channel, float angleDeg) {
+  setServoAngleWithRange(channel, angleDeg, SERVO_RANGE_DEG);
+}
+
+// Wrist uses 270° mapping
+void setWrist(uint8_t wristIdx, float angleDeg) {
+  if (wristIdx == 0) {
+    lastWristDeg[0] = clampf(angleDeg, 0.0f, WRIST_RANGE_DEG);
+    setServoAngleWithRange(WRIST1_CH, lastWristDeg[0], WRIST_RANGE_DEG);
+  } else if (wristIdx == 1) {
+    lastWristDeg[1] = clampf(angleDeg, 0.0f, WRIST_RANGE_DEG);
+    setServoAngleWithRange(WRIST2_CH, lastWristDeg[1], WRIST_RANGE_DEG);
+  }
+}
+
+void applyFingerAngles(uint8_t fIdx) {
+  const FingerConfig &f = FINGERS[fIdx];
+  setServoAngle(f.bottomCh, lastBottomDeg[fIdx]);
+  setServoAngle(f.topCh,    lastTopDeg[fIdx]);
+
+  if (f.extraCh != NO_CH) {
+    setServoAngle(f.extraCh, lastExtraDeg[fIdx]);
+  }
+}
+
+void setFinger(uint8_t fIdx) {
+  if (fIdx >= NUM_FINGERS) return;
+  currentFinger = fIdx;
+
+  // Move selected finger to its remembered angles immediately
+  applyFingerAngles(currentFinger);
+
+  Serial.print("FINGER,");
+  Serial.print(currentFinger);
+  Serial.print(",");
+  Serial.print(FINGERS[currentFinger].name);
+  Serial.print(",bottomCh=");
+  Serial.print(FINGERS[currentFinger].bottomCh);
+  Serial.print(",topCh=");
+  Serial.print(FINGERS[currentFinger].topCh);
+  Serial.print(",bottomDeg=");
+  Serial.print(lastBottomDeg[currentFinger], 1);
+  Serial.print(",topDeg=");
+  Serial.print(lastTopDeg[currentFinger], 1);
+
+  if (FINGERS[currentFinger].extraCh != NO_CH) {
+    Serial.print(",extraCh=");
+    Serial.print(FINGERS[currentFinger].extraCh);
+    Serial.print(",extraDeg=");
+    Serial.print(lastExtraDeg[currentFinger], 1);
+  }
+
+  Serial.println();
+}
+
+// Parse commands like:
+//   "F:4"        -> select finger index 4 (Thumb)
+//   "0:135.0"    -> set TOP joint angle for selected finger (0..180)
+//   "1:60.0"     -> set BOTTOM joint angle for selected finger (0..180)
+//   "2:90.0"     -> set EXTRA servo angle (Thumb only) (0..180)
+//   "3:135.0"    -> set WRIST1 (PCA ch11) angle (0..270)
+//   "4:135.0"    -> set WRIST2 (PCA ch12) angle (0..270)
+void handleLine(const String &lineIn) {
+  String line = lineIn;
+  line.trim();
+  if (line.length() == 0) return;
+
+  int sep = line.indexOf(':');
+  if (sep < 0) sep = line.indexOf(',');
+  if (sep < 0) return;
+
+  String lhs = line.substring(0, sep);
+  String rhs = line.substring(sep + 1);
+
+  lhs.trim();
+  rhs.trim();
+
+  // Finger select command
+  if (lhs.equalsIgnoreCase("F")) {
+    int idx = rhs.toInt();
+    if (idx >= 0 && idx < (int)NUM_FINGERS) {
+      setFinger((uint8_t)idx);
+    }
+    return;
+  }
+
+  int logical = lhs.toInt();
+  float angle = rhs.toFloat();
+
+  // Wrist commands are global (do NOT depend on selected finger)
+  if (logical == 3) {
+    setWrist(0, angle);
+    return;
+  } else if (logical == 4) {
+    setWrist(1, angle);
+    return;
+  }
+
+  // Finger commands depend on selected finger
+  const FingerConfig &f = FINGERS[currentFinger];
+
+  if (logical == 0) {
+    // TOP (0..180)
+    angle = clampf(angle, 0.0f, SERVO_RANGE_DEG);
+    lastTopDeg[currentFinger] = angle;
+    setServoAngle(f.topCh, angle);
+
+  } else if (logical == 1) {
+    // BOTTOM (0..180)
+    angle = clampf(angle, 0.0f, SERVO_RANGE_DEG);
+    lastBottomDeg[currentFinger] = angle;
+    setServoAngle(f.bottomCh, angle);
+
+  } else if (logical == 2) {
+    // EXTRA (Thumb only) (0..180)
+    if (f.extraCh != NO_CH) {
+      angle = clampf(angle, 0.0f, SERVO_RANGE_DEG);
+      lastExtraDeg[currentFinger] = angle;
+      setServoAngle(f.extraCh, angle);
+    }
+  }
+}
+
+String rxLine;
+
+// Telemetry timing
+unsigned long lastPotMs = 0;
+const unsigned long POT_PERIOD_MS = 50; // 20 Hz updates
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
+
+  Wire.begin();
+  pca.begin();
+  pca.setPWMFreq(PCA_FREQ_HZ);
+  delay(10);
+
+  // Initialize remembered angles to each finger's initial positions
+  for (uint8_t i = 0; i < NUM_FINGERS; i++) {
+    lastBottomDeg[i] = FINGERS[i].bottomInit;
+    lastTopDeg[i]    = FINGERS[i].topInit;
+    lastExtraDeg[i]  = (FINGERS[i].extraCh != NO_CH) ? FINGERS[i].extraInit : 0.0f;
+  }
+
+  // Move ALL fingers to init at boot
+  for (uint8_t i = 0; i < NUM_FINGERS; i++) {
+    const FingerConfig &f = FINGERS[i];
+    setServoAngle(f.bottomCh, lastBottomDeg[i]);
+    setServoAngle(f.topCh,    lastTopDeg[i]);
+    if (f.extraCh != NO_CH) {
+      setServoAngle(f.extraCh, lastExtraDeg[i]);
+    }
+  }
+
+  // Move wrists to init at boot
+  setWrist(0, WRIST1_INIT);
+  setWrist(1, WRIST2_INIT);
+
+  // Default selection
+  setFinger(currentFinger);
+
+  Serial.println("Ready.");
+  Serial.println("Commands:");
+  Serial.println("  F:<0-4>   select finger (0=Pinky,1=Ring,2=Middle,3=Pointer,4=Thumb)");
+  Serial.println("  0:<deg>   set TOP joint angle for selected finger (0–180)");
+  Serial.println("  1:<deg>   set BOTTOM joint angle for selected finger (0–180)");
+  Serial.println("  2:<deg>   set EXTRA angle (Thumb only) (0–180)");
+  Serial.println("  3:<deg>   set WRIST1 angle (PCA ch11) (0–270)");
+  Serial.println("  4:<deg>   set WRIST2 angle (PCA ch12) (0–270)");
+  Serial.println("Pot telemetry format: POT,a0_raw,a1_raw,a0_v,a1_v");
+}
+
+void loop() {
+  // --- Read complete lines from Serial (servo commands) ---
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      rxLine.trim();
+      if (rxLine.length() > 0) handleLine(rxLine);
+      rxLine = "";
+    } else {
+      if (rxLine.length() < 64) rxLine += c;
+    }
+  }
+
+  // --- Periodically send pot readings (does NOT affect servos) ---
+  unsigned long now = millis();
+  if (now - lastPotMs >= POT_PERIOD_MS) {
+    lastPotMs = now;
+
+    int a0 = analogRead(POT0_PIN);
+    int a1 = analogRead(POT1_PIN);
+
+    float v0 = a0 * (VREF / (float)ADC_MAX);
+    float v1 = a1 * (VREF / (float)ADC_MAX);
+
+    Serial.print("POT,");
+    Serial.print(a0);
+    Serial.print(",");
+    Serial.print(a1);
+    Serial.print(",");
+    Serial.print(v0, 3);
+    Serial.print(",");
+    Serial.println(v1, 3);
+  }
+}
